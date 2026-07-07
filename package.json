@@ -1,0 +1,24 @@
+{
+  "name": "self-improving-skills",
+  "version": "0.1.0",
+  "description": "opencode port of Hermes-style self-improvement loop (UniM0cha/claude-self-improving-skills + okdk7788/skill-evolution). Distills learned skills after complex work, captures outcome telemetry, runs GEPA-style optimization.",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts",
+    "./default": "./index.ts"
+  },
+  "keywords": [
+    "opencode-plugin",
+    "self-improving",
+    "skills",
+    "hermes",
+    "gepa",
+    "evolution"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": ""
+}

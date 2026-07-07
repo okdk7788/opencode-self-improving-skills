@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# TypeScript build artifacts
+*.tsbuildinfo
+dist/
+build/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local config / secrets
+.env
+.env.local
+
+# Test scratch
+*.tmp
+*.bak
