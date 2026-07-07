@@ -71,7 +71,7 @@ const CURATE_INTERVAL_DAYS = envInt("SIS_CURATE_INTERVAL_DAYS", 7)
 // ────────────────────────────────────────────────────────────────────────────
 
 function ensureDirs(): void {
-  for (const d of [STATE_DIR, BACKUP_DIR]) {
+  for (const d of [STATE_DIR, BACKUP_DIR, path.join(STATE_DIR, "logs")]) {
     try { fs.mkdirSync(d, { recursive: true }) } catch { /* exists */ }
   }
 }
@@ -87,11 +87,22 @@ function readJSON<T>(file: string, fallback: T): T {
 
 function writeJSONAtomic(file: string, data: unknown): void {
   ensureDirs()
-  const tmp = file + ".tmp"
+  // Unique tmp name per write — concurrent writers (parallel sessions or
+  // parallel tool calls) would otherwise share `.tmp` and clobber each other.
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+  let fd: number | null = null
   try {
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8")
+    // Use openSync + fsyncSync + closeSync so the tmp is durable before rename.
+    // writeFileSync alone does not guarantee the data is on disk before rename
+    // completes — a crash between write and rename can leave an empty file.
+    fd = fs.openSync(tmp, "w")
+    fs.writeFileSync(fd, JSON.stringify(data, null, 2), "utf-8")
+    fs.fsyncSync(fd)
+    fs.closeSync(fd)
+    fd = null
     fs.renameSync(tmp, file)
   } catch {
+    if (fd !== null) { try { fs.closeSync(fd) } catch { /* noop */ } }
     try { fs.unlinkSync(tmp) } catch { /* noop */ }
   }
 }
@@ -202,6 +213,13 @@ function saveUsage(data: UsageStore): void {
 
 function bumpUsage(skill: string, kind: "use" | "view" | "patch"): void {
   try {
+    // Reject reserved/malicious keys: "_meta" would clobber the store's
+    // metadata bag, "__proto__"/"constructor"/"prototype" enable prototype
+    // pollution, and any non-string from upstream callers falls back to a
+    // no-op rather than corrupting the store.
+    if (typeof skill !== "string" || skill.startsWith("_") || skill === "__proto__" || skill === "constructor" || skill === "prototype") {
+      return
+    }
     const data = loadUsage()
     if (!data[skill] || typeof data[skill] !== "object" || !("use_count" in data[skill])) {
       data[skill] = emptyUsageRecord()
@@ -300,6 +318,12 @@ function markOptimized(skill: string): void {
   try {
     const data = loadOutcomes()
     data._meta.optimized_at[skill] = nowIso()
+    // Reset the evolution cooldown so the just-optimized version gets a fresh
+    // 24h window to accumulate new outcomes before being re-nudged. Without
+    // this, the old cooldown timestamp from before the rewrite would still
+    // gate the next nudge, causing over-eager re-nudging of a skill whose
+    // new version hasn't been exercised yet.
+    data._meta.evolution_nudge_at[skill] = nowIso()
     saveOutcomes(data)
   } catch { /* best-effort */ }
 }
@@ -423,7 +447,7 @@ function backupSkill(filePath: string): string | null {
     fs.copyFileSync(filePath, dest)
     const prefix = `${name}.`
     const all = fs.readdirSync(BACKUP_DIR)
-      .filter(f => f.startsWith(prefix) && f.endsWith(".SKILL.md"))
+      .filter((f: string) => f.startsWith(prefix) && f.endsWith(".SKILL.md"))
       .sort()
     while (all.length > 10) {
       const old = all.shift()
@@ -435,7 +459,11 @@ function backupSkill(filePath: string): string | null {
 
 function validateSkillFrontmatter(filePath: string): { ok: boolean; error?: string } {
   try {
-    const content = fs.readFileSync(filePath, "utf-8")
+    let content = fs.readFileSync(filePath, "utf-8")
+    // Strip UTF-8 BOM (EF BB BF → U+FEFF when decoded) — some editors emit
+    // it, and `content.startsWith("---")` returns false if BOM is present,
+    // causing every BOM-prefixed SKILL.md to be rejected and rolled back.
+    if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1)
     if (!content.startsWith("---")) {
       return { ok: false, error: "Missing YAML frontmatter opening `---`" }
     }
@@ -635,14 +663,32 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
 
         // Pending nudge? (substantial work this session, not yet distilled)
         const sessions = loadNudge().sessions
-        // We don't know which session this transform is for from input alone,
-        // so we surface any session in the nudge file that has nudged_at === null
-        // AND substantial work. The agent will pick up the hint.
-        const pending = Object.entries(sessions)
-          .filter(([, s]) => s.tool_calls >= DISTILL_THRESHOLD && s.file_edits >= MIN_FILE_EDITS && !s.nudged_at)
-          .sort(([, a], [, b]) => b.tool_calls - a.tool_calls)
-        if (pending.length > 0) {
-          const [sid, s] = pending[0]
+        // Scope the nudge to the CURRENT session so two parallel opencode
+        // instances don't surface each other's pending work into the wrong
+        // system prompt (the agent can't read the other session's transcript).
+        const currentSid = resolveSessionId(_input)
+        let nudgeTarget: { sid: string; s: NudgeState["sessions"][string] } | null = null
+        if (currentSid) {
+          const my = sessions[currentSid]
+          if (my && my.tool_calls >= DISTILL_THRESHOLD && my.file_edits >= MIN_FILE_EDITS && !my.nudged_at) {
+            nudgeTarget = { sid: currentSid, s: my }
+          }
+        } else {
+          // Fallback: sid not available in transform input — pick the most
+          // recently-updated pending session within the last 30 minutes, to
+          // avoid nudging about stale sessions the user has walked away from.
+          const cutoff = Date.now() - 30 * 60 * 1000
+          const recent = Object.entries(sessions)
+            .filter(([, s]) =>
+              s.tool_calls >= DISTILL_THRESHOLD &&
+              s.file_edits >= MIN_FILE_EDITS &&
+              !s.nudged_at &&
+              Date.parse(s.last_updated) >= cutoff)
+            .sort(([, a], [, b]) => Date.parse(b.last_updated) - Date.parse(a.last_updated))
+          if (recent.length > 0) nudgeTarget = { sid: recent[0][0], s: recent[0][1] }
+        }
+        if (nudgeTarget) {
+          const { sid, s } = nudgeTarget
           lines.push(
             `[자기개선 트리거] 세션 ${sid.slice(0, 12)}…에서 도구 호출 ${s.tool_calls}회·파일 편집 ${s.file_edits}회 ` +
             "누적됐고 아직 스킬로 증류되지 않았습니다. 이번 작업에 재사용 가능한 기법이 있다면 " +
@@ -668,7 +714,9 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
     "tool.execute.before": async (input, output) => {
       try {
         if (!EDIT_TOOLS.has(input.tool)) return
-        const fp = output.args?.filePath as string | undefined
+        // input.args is not in the strict type but is present at runtime —
+        // cast to any so we can read filePath without fighting the type def.
+        const fp = (input as any).args?.filePath as string | undefined
         if (!fp || !isSkillPath(fp)) return
         backupsThisCall[input.callID] = backupSkill(fp)
         const name = skillNameFromPath(fp)
@@ -681,11 +729,28 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
     // ── Validate after SKILL.md edits + count all tool calls ──────────────
     "tool.execute.after": async (input, _output) => {
       try {
-        // Telemetry: count tool calls per session
-        bumpCounters(input.sessionID, input.tool, input.args)
-        const c = counters[input.sessionID]
+        try {
+          const debugLogPath = path.join(STATE_DIR, "logs", "plugin-debug.log")
+          const rawSid = (input as any)?.sessionID
+          fs.appendFileSync(debugLogPath, JSON.stringify({
+            ts: new Date().toISOString(),
+            tool: input.tool,
+            sessionID: rawSid,
+            sessionID_type: typeof rawSid,
+            sessionID_length: typeof rawSid === "string" ? rawSid.length : null,
+            input_keys: Object.keys(input),
+            metadata_keys: (input as any)?.metadata ? Object.keys((input as any).metadata) : [],
+          }) + "\n")
+        } catch {}
+
+        // opencode 1.17+ sometimes passes undefined/truncated sessionID;
+        // resolveSessionId (module-scope helper) handles multiple sources.
+        const sid = resolveSessionId(input)
+
+        bumpCounters(sid, input.tool, input.args)
+        const c = counters[sid]
         if (c) {
-          updateSessionState(input.sessionID, {
+          updateSessionState(sid, {
             tool_calls: c.tool_calls,
             file_edits: c.file_edits,
           })
@@ -696,9 +761,9 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           const name = input.args.name
           if (learned.has(name)) {
             bumpUsage(name, "use")
-            const state = getSessionState(input.sessionID)
+            const state = getSessionState(sid)
             if (!state.skills_used.includes(name)) {
-              updateSessionState(input.sessionID, {
+              updateSessionState(sid, {
                 skills_used: [...state.skills_used, name],
                 outcome_recorded: false,
               })
@@ -743,14 +808,35 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
 
     // ── Session idle: record outcomes for skills used this session ────────
     event: async ({ event }) => {
-      if (event.type !== "session.idle") return
-      const sessionId = event.properties.sessionID
+      // Resolve session ID from multiple plausible payload shapes — opencode
+      // event properties vary across versions and we never want sessionId to
+      // be undefined (which would create a bogus "undefined" key in
+      // nudge_state.json and silently break outcome tracking).
+      const sessionId = resolveEventSessionId(event)
+      // Cast event.type to string — opencode's strict event type union does
+      // not currently include "session.end", but it can fire at runtime and
+      // we use it as a cleanup trigger for in-memory per-session state.
+      const eventType = event.type as string
+      if (eventType === "session.idle" || eventType === "session.end") {
+        // Free per-session in-memory state to prevent unbounded growth of
+        // counters / backupsThisCall over the plugin's lifetime.
+        if (sessionId) {
+          delete counters[sessionId]
+        }
+        if (eventType === "session.end") return
+      }
+      if (eventType !== "session.idle") return
+      if (!sessionId || typeof sessionId !== "string") return
       try {
         const state = getSessionState(sessionId)
         if (state.outcome_recorded) return
         const used = state.skills_used ?? []
         if (used.length === 0) {
-          updateSessionState(sessionId, { outcome_recorded: true })
+          // Do NOT set outcome_recorded here. session.idle fires every turn,
+          // not just at session end. If we burn the flag now, future skill
+          // uses in this session will never be recorded — which permanently
+          // disables the GEPA evolution loop. Just return and try again on
+          // the next idle.
           return
         }
         let failureSignal: string | null = null
@@ -874,7 +960,22 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
               }),
             }
           }
+          // Defense against path traversal: `target` comes from LLM tool args,
+          // so `../../etc/SKILL.md` would otherwise let an attacker read any
+          // file named SKILL.md on the system via this tool's readFileSync.
+          if (!/^[a-z0-9][a-z0-9-]*$/i.test(target)) {
+            return {
+              output: JSON.stringify({
+                error: "invalid_skill_name",
+                hint: `Skill name must match /^[a-z0-9][a-z0-9-]*$/i — got "${target.slice(0, 64)}"`,
+              }),
+            }
+          }
           const skillPath = path.join(SKILLS_DIR, target, "SKILL.md")
+          const resolved = path.resolve(skillPath)
+          if (!resolved.startsWith(SKILLS_DIR + path.sep)) {
+            return { output: JSON.stringify({ error: "path traversal blocked" }) }
+          }
           if (!fs.existsSync(skillPath)) {
             return { output: JSON.stringify({ error: `Skill not found: ${skillPath}` }) }
           }
@@ -932,7 +1033,7 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             output: JSON.stringify({
               total_skills: learned.size,
               ranking: rows,
-              top_candidate: rows[0]?.priority > 0
+              top_candidate: rows[0]?.priority > 0 && (rows[0]?.fail ?? 0) > 0
                 ? { name: rows[0].name, reason: `use=${rows[0].use}, fail=${rows[0].fail}/${rows[0].ok + rows[0].fail}` }
                 : null,
               hint: rows.length === 0 || rows.every(r => r.use === 0)
@@ -959,6 +1060,42 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
       }),
     },
   }
+}
+
+function resolveSessionId(inp: any): string {
+  // opencode 1.17+ sometimes passes undefined/truncated sessionID in tool
+  // hook payloads; resolve from multiple sources. Returns "_unknown_session"
+  // (a stable string key) when nothing is available — never undefined, so
+  // downstream map access can't produce a bogus "undefined" key.
+  const direct = inp?.sessionID
+  if (typeof direct === "string" && direct.length >= 8) return direct
+  const metaSid = inp?.metadata?.sessionID
+  if (typeof metaSid === "string" && metaSid.length >= 8) return metaSid
+  const metaSession = inp?.metadata?.session
+  if (typeof metaSession === "string" && metaSession.length >= 8) return metaSession
+  const envSid =
+    process.env.OPOCODE_SESSION_ID ||
+    process.env.OPENCODE_SESSION_ID ||
+    process.env.SESSION_ID
+  if (typeof envSid === "string" && envSid.length >= 8) return envSid
+  return "_unknown_session"
+}
+
+function resolveEventSessionId(event: any): string | null {
+  const candidates = [
+    event?.properties?.sessionID,
+    event?.properties?.sessionId,
+    event?.properties?.session?.id,
+    event?.properties?.session,
+    event?.payload?.sessionID,
+    event?.payload?.sessionId,
+    event?.sessionID,
+    event?.sessionId,
+  ]
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length >= 8) return c
+  }
+  return null
 }
 
 function countLearnedSkills(): number {
