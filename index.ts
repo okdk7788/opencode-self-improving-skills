@@ -63,6 +63,7 @@ function envInt(name: string, def: number): number {
 
 const DISTILL_THRESHOLD = envInt("SIS_DISTILL_THRESHOLD", 12)
 const MIN_FILE_EDITS = envInt("SIS_MIN_FILE_EDITS", 2)
+const RENUDGE_INTERVAL = envInt("SIS_RENUDGE_INTERVAL", 20)
 const CURATE_MIN_SKILLS = envInt("SIS_CURATE_MIN_SKILLS", 8)
 const CURATE_INTERVAL_DAYS = envInt("SIS_CURATE_INTERVAL_DAYS", 7)
 
@@ -378,6 +379,9 @@ type NudgeState = {
     tool_calls: number
     file_edits: number
     nudged_at: string | null
+    last_nudge_tool_calls: number
+    last_file_edit_ts: string | null
+    devlog_nudged_at: string | null
     outcome_recorded: boolean
     skills_used: string[]
     last_updated: string
@@ -401,6 +405,9 @@ function getSessionState(sessionId: string): NudgeState["sessions"][string] {
       tool_calls: 0,
       file_edits: 0,
       nudged_at: null,
+      last_nudge_tool_calls: 0,
+      last_file_edit_ts: null,
+      devlog_nudged_at: null,
       outcome_recorded: false,
       skills_used: [],
       last_updated: nowIso(),
@@ -418,6 +425,9 @@ function updateSessionState(sessionId: string, patch: Partial<NudgeState["sessio
         tool_calls: 0,
         file_edits: 0,
         nudged_at: null,
+        last_nudge_tool_calls: 0,
+        last_file_edit_ts: null,
+        devlog_nudged_at: null,
         outcome_recorded: false,
         skills_used: [],
         last_updated: nowIso(),
@@ -613,8 +623,14 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
   // Track which SKILL.md backups we made this call, so .after can roll back
   const backupsThisCall: Record<string, string | null> = {}
 
-  function bumpCounters(sessionId: string, tool: string, args: any): void {
-    if (!counters[sessionId]) counters[sessionId] = { tool_calls: 0, file_edits: 0 }
+  function bumpCounters(sessionId: string, tool: string, _args: any): void {
+    if (!counters[sessionId]) {
+      const persisted = getSessionState(sessionId)
+      counters[sessionId] = {
+        tool_calls: persisted.tool_calls,
+        file_edits: persisted.file_edits,
+      }
+    }
     counters[sessionId].tool_calls++
     if (EDIT_TOOLS.has(tool)) {
       counters[sessionId].file_edits++
@@ -663,27 +679,25 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
 
         // Pending nudge? (substantial work this session, not yet distilled)
         const sessions = loadNudge().sessions
-        // Scope the nudge to the CURRENT session so two parallel opencode
-        // instances don't surface each other's pending work into the wrong
-        // system prompt (the agent can't read the other session's transcript).
         const currentSid = resolveSessionId(_input)
         let nudgeTarget: { sid: string; s: NudgeState["sessions"][string] } | null = null
         if (currentSid) {
           const my = sessions[currentSid]
-          if (my && my.tool_calls >= DISTILL_THRESHOLD && my.file_edits >= MIN_FILE_EDITS && !my.nudged_at) {
-            nudgeTarget = { sid: currentSid, s: my }
+          if (my && my.tool_calls >= DISTILL_THRESHOLD && my.file_edits >= MIN_FILE_EDITS) {
+            const sinceLast = my.tool_calls - (my.last_nudge_tool_calls ?? 0)
+            if (!my.nudged_at || sinceLast >= RENUDGE_INTERVAL) {
+              nudgeTarget = { sid: currentSid, s: my }
+            }
           }
         } else {
-          // Fallback: sid not available in transform input — pick the most
-          // recently-updated pending session within the last 30 minutes, to
-          // avoid nudging about stale sessions the user has walked away from.
           const cutoff = Date.now() - 30 * 60 * 1000
           const recent = Object.entries(sessions)
-            .filter(([, s]) =>
-              s.tool_calls >= DISTILL_THRESHOLD &&
-              s.file_edits >= MIN_FILE_EDITS &&
-              !s.nudged_at &&
-              Date.parse(s.last_updated) >= cutoff)
+            .filter(([, s]) => {
+              if (s.tool_calls < DISTILL_THRESHOLD || s.file_edits < MIN_FILE_EDITS) return false
+              if (Date.parse(s.last_updated) < cutoff) return false
+              const sinceLast = s.tool_calls - (s.last_nudge_tool_calls ?? 0)
+              return !s.nudged_at || sinceLast >= RENUDGE_INTERVAL
+            })
             .sort(([, a], [, b]) => Date.parse(b.last_updated) - Date.parse(a.last_updated))
           if (recent.length > 0) nudgeTarget = { sid: recent[0][0], s: recent[0][1] }
         }
@@ -693,10 +707,31 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             `[자기개선 트리거] 세션 ${sid.slice(0, 12)}…에서 도구 호출 ${s.tool_calls}회·파일 편집 ${s.file_edits}회 ` +
             "누적됐고 아직 스킬로 증류되지 않았습니다. 이번 작업에 재사용 가능한 기법이 있다면 " +
             "`distill_skill` 툴을 호출하거나 `skill-distiller` 스킬을 로드해 증류하세요. " +
-            "일회성 작업이라면 그대로 두세요 (nudge는 한 번만 발생)."
+            "일회성 작업이라면 그대로 두세요."
           )
-          // mark nudged so it doesn't re-fire every turn
-          updateSessionState(sid, { nudged_at: nowIso() })
+          updateSessionState(sid, { nudged_at: nowIso(), last_nudge_tool_calls: s.tool_calls })
+        }
+
+        // DEVLOG staleness check: if ≥3 file edits this session and DEVLOG.md
+        // hasn't been touched since the last edit, nudge the agent to update it.
+        if (currentSid) {
+          const my = sessions[currentSid]
+          if (my && my.file_edits >= 3 && my.last_file_edit_ts && !my.devlog_nudged_at) {
+            try {
+              const devlogPath = path.join(process.cwd(), "DEVLOG.md")
+              if (fs.existsSync(devlogPath)) {
+                const devlogMtime = fs.statSync(devlogPath).mtimeMs
+                if (devlogMtime < Date.parse(my.last_file_edit_ts)) {
+                  lines.push(
+                    `[DEVLOG 알림] 이번 세션에서 파일 편집 ${my.file_edits}회 수행했지만 DEVLOG.md가 업데이트되지 않았습니다. ` +
+                    "AGENTS.md 규칙에 따라 작업 세션 마무리 시 DEVLOG.md에 항목을 추가하세요 " +
+                    "(날짜 / 무엇을 / 왜 이 방식 / 한계·개선 후보)."
+                  )
+                  updateSessionState(currentSid, { devlog_nudged_at: nowIso() })
+                }
+              }
+            } catch { /* best-effort */ }
+          }
         }
 
         const evoHint = pickEvolutionCandidate()
@@ -769,6 +804,10 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
               })
             }
           }
+        }
+
+        if (EDIT_TOOLS.has(input.tool)) {
+          updateSessionState(sid, { last_file_edit_ts: nowIso(), devlog_nudged_at: null })
         }
 
         // Validate SKILL.md after edit/write
