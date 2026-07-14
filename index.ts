@@ -707,7 +707,7 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             `[자기개선 트리거] 세션 ${sid.slice(0, 12)}…에서 도구 호출 ${s.tool_calls}회·파일 편집 ${s.file_edits}회 ` +
             "누적됐고 아직 스킬로 증류되지 않았습니다. 이번 작업에 재사용 가능한 기법이 있다면 " +
             "`distill_skill` 툴을 호출하거나 `skill-distiller` 스킬을 로드해 증류하세요. " +
-            "일회성 작업이라면 그대로 두세요."
+            "일회성 작업이라면 사용자에게 한 줄로 이유를 알리고 넘어가세요 — 조용히 무시하지 마세요."
           )
           updateSessionState(sid, { nudged_at: nowIso(), last_nudge_tool_calls: s.tool_calls })
         }
