@@ -51,7 +51,9 @@ const BACKUP_DIR = path.join(STATE_DIR, "backups")
 const CURATOR_STATE = path.join(STATE_DIR, "curator_state.json")
 
 const PROVENANCE_KEY = "self-improving-skills"
-const EDIT_TOOLS = new Set(["write", "edit"])
+// OpenCode's native patch tool is named `apply_patch`; keep it in the edit
+// counter so the distillation threshold works for real OpenCode sessions.
+const EDIT_TOOLS = new Set(["write", "edit", "apply_patch"])
 const SKILL_MARKER = "skill-distiller"
 
 function envInt(name: string, def: number): number {

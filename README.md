@@ -98,6 +98,21 @@ The evolution trigger has hard-coded thresholds (`use ≥ 2`, `fail ≥ 1`, 24h 
 | `skill-distiller` subagent | `skill-distiller` skill | opencode: skills ARE the subagent mechanism |
 | `/distill-skill`, `/optimize-skill`, `/evolution-status`, `/curator-status` slash commands | custom tools | Same procedures, different invocation surface |
 
+## Upstream compatibility boundary
+
+This directory is the OpenCode adapter and is intentionally separate from the
+Claude Code upstream plugin under `~/.claude/plugins/`. Upstream updates can
+change the distillation threshold, tool names, transcript shapes, Hook event
+names, or storage conventions. When updating the upstream plugin, re-check
+`EDIT_TOOLS`, `resolveSessionId`, the `session.idle` handler, and the
+`~/.config/opencode/skills/` storage path before assuming the adapter still
+counts edits and emits nudges correctly.
+
+The `apply_patch` tool is included in `EDIT_TOOLS` because it is OpenCode's
+native file-edit operation; without it, a session can accumulate many tool
+calls while its file-edit count remains zero and the distillation threshold
+never fires.
+
 ## Why TypeScript, not Python (like the Claude original)
 
 The Claude originals shell out to Python scripts via bash hooks. opencode plugins are natively TS/JS — writing the logic in TS means:
