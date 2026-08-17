@@ -5,10 +5,13 @@
  * companion skill-evolution (okdk7788/skill-evolution). Ported to opencode's
  * TS plugin model with the same 4-stage loop:
  *
- *   1. TRIGGER   — `experimental.chat.system.transform` injects an advisory
- *                  when the session has done substantial work that hasn't been
- *                  distilled yet. (Equivalent of Claude Code's Stop hook nudge +
- *                  SessionStart advisory, fused because opencode has neither.)
+ *   1. TRIGGER   — two channels: `experimental.chat.messages.transform`
+ *                  appends a synthetic LAST user message when the session has
+ *                  done substantial work not yet distilled (high-visibility —
+ *                  the agent must respond to it in-turn); and an evergreen
+ *                  advisory in `experimental.chat.system.transform` keeps the
+ *                  loop active every turn. (opencode has no Stop hook, so the
+ *                  Claude Code nudge was re-routed to message injection.)
  *   2. REVIEW    — the `skill-distiller` skill (sibling SKILL.md) holds the
  *                  decision procedure. The agent invokes it via the `skill`
  *                  tool when the advisory fires or the user asks.
@@ -679,40 +682,10 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
           }
         }
 
-        // Pending nudge? (substantial work this session, not yet distilled)
+        // Pending nudge is delivered via experimental.chat.messages.transform
+        // (synthetic last message, far more visible than a system-prompt line).
         const sessions = loadNudge().sessions
         const currentSid = resolveSessionId(_input)
-        let nudgeTarget: { sid: string; s: NudgeState["sessions"][string] } | null = null
-        if (currentSid) {
-          const my = sessions[currentSid]
-          if (my && my.tool_calls >= DISTILL_THRESHOLD && my.file_edits >= MIN_FILE_EDITS) {
-            const sinceLast = my.tool_calls - (my.last_nudge_tool_calls ?? 0)
-            if (!my.nudged_at || sinceLast >= RENUDGE_INTERVAL) {
-              nudgeTarget = { sid: currentSid, s: my }
-            }
-          }
-        } else {
-          const cutoff = Date.now() - 30 * 60 * 1000
-          const recent = Object.entries(sessions)
-            .filter(([, s]) => {
-              if (s.tool_calls < DISTILL_THRESHOLD || s.file_edits < MIN_FILE_EDITS) return false
-              if (Date.parse(s.last_updated) < cutoff) return false
-              const sinceLast = s.tool_calls - (s.last_nudge_tool_calls ?? 0)
-              return !s.nudged_at || sinceLast >= RENUDGE_INTERVAL
-            })
-            .sort(([, a], [, b]) => Date.parse(b.last_updated) - Date.parse(a.last_updated))
-          if (recent.length > 0) nudgeTarget = { sid: recent[0][0], s: recent[0][1] }
-        }
-        if (nudgeTarget) {
-          const { sid, s } = nudgeTarget
-          lines.push(
-            `[자기개선 트리거] 세션 ${sid.slice(0, 12)}…에서 도구 호출 ${s.tool_calls}회·파일 편집 ${s.file_edits}회 ` +
-            "누적됐고 아직 스킬로 증류되지 않았습니다. 이번 작업에 재사용 가능한 기법이 있다면 " +
-            "`distill_skill` 툴을 호출하거나 `skill-distiller` 스킬을 로드해 증류하세요. " +
-            "일회성 작업이라면 사용자에게 한 줄로 이유를 알리고 넘어가세요 — 조용히 무시하지 마세요."
-          )
-          updateSessionState(sid, { nudged_at: nowIso(), last_nudge_tool_calls: s.tool_calls })
-        }
 
         // DEVLOG staleness check: if ≥3 file edits this session and DEVLOG.md
         // hasn't been touched since the last edit, nudge the agent to update it.
@@ -744,6 +717,49 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
         output.system.push(lines.join("\n\n"))
       } catch {
         // Advisory is best-effort — never break the chat
+      }
+    },
+
+    // ── High-visibility nudge: synthetic LAST user message ────────────────
+    // The agent sees this as the final message of the context — same shape as
+    // opencode's own system-reminders — and must acknowledge it in-turn.
+    "experimental.chat.messages.transform": async (_input, output) => {
+      try {
+        if (output.messages.length === 0) return
+        const target = pickNudgeTarget(loadNudge().sessions, null)
+        if (!target) return
+        const last = output.messages[output.messages.length - 1]
+        const sid = target.sid
+        const mid = `sis-nudge-${Date.now()}`
+        output.messages.push({
+          info: {
+            id: mid,
+            sessionID: sid,
+            role: "user",
+            time: { created: Date.now() },
+            agent: last.info.role === "user" ? last.info.agent : "build",
+            model:
+              last.info.role === "user"
+                ? last.info.model
+                : { providerID: "sis", modelID: "nudge" },
+          },
+          parts: [
+            {
+              id: `${mid}-part`,
+              sessionID: sid,
+              messageID: mid,
+              type: "text",
+              text: buildNudgeText(target),
+              synthetic: true,
+            },
+          ],
+        })
+        updateSessionState(sid, {
+          nudged_at: nowIso(),
+          last_nudge_tool_calls: target.s.tool_calls,
+        })
+      } catch {
+        // best-effort — never break the chat
       }
     },
 
@@ -1120,6 +1136,48 @@ function resolveSessionId(inp: any): string {
     process.env.SESSION_ID
   if (typeof envSid === "string" && envSid.length >= 8) return envSid
   return "_unknown_session"
+}
+
+// ── Nudge target resolution (shared by delivery channels) ─────────────────
+// currentSid null/"_unknown_session" (messages.transform gets no sessionID)
+// → fall back to most recently active qualifying session (30min window).
+type NudgeTarget = { sid: string; s: NudgeState["sessions"][string] }
+
+function pickNudgeTarget(
+  sessions: NudgeState["sessions"],
+  currentSid: string | null,
+): NudgeTarget | null {
+  if (currentSid && currentSid !== "_unknown_session") {
+    const my = sessions[currentSid]
+    if (my && my.tool_calls >= DISTILL_THRESHOLD && my.file_edits >= MIN_FILE_EDITS) {
+      const sinceLast = my.tool_calls - (my.last_nudge_tool_calls ?? 0)
+      if (!my.nudged_at || sinceLast >= RENUDGE_INTERVAL) {
+        return { sid: currentSid, s: my }
+      }
+    }
+    return null
+  }
+  const cutoff = Date.now() - 30 * 60 * 1000
+  const recent = Object.entries(sessions)
+    .filter(([, s]) => {
+      if (s.tool_calls < DISTILL_THRESHOLD || s.file_edits < MIN_FILE_EDITS) return false
+      if (Date.parse(s.last_updated) < cutoff) return false
+      const sinceLast = s.tool_calls - (s.last_nudge_tool_calls ?? 0)
+      return !s.nudged_at || sinceLast >= RENUDGE_INTERVAL
+    })
+    .sort(([, a], [, b]) => Date.parse(b.last_updated) - Date.parse(a.last_updated))
+  return recent.length > 0 ? { sid: recent[0][0], s: recent[0][1] } : null
+}
+
+function buildNudgeText(t: NudgeTarget): string {
+  return (
+    "[SYSTEM REMINDER - SELF-IMPROVEMENT NUDGE]\n" +
+    `세션 ${t.sid.slice(0, 12)}…에서 도구 호출 ${t.s.tool_calls}회·파일 편집 ${t.s.file_edits}회 ` +
+    "누적됐고 아직 스킬로 증류되지 않았습니다. 지금 이 턴에서 반드시 응답하세요:\n" +
+    "- 재사용 가능한 기법이 있다면 → `distill_skill` 툴 호출 또는 `skill-distiller` 스킬 로드\n" +
+    "- 일회성 작업이라면 → 사용자에게 한 줄로 근거를 남기고 넘어감\n" +
+    "- 조용히 무시하는 것은 금지 (AGENTS.md 셀프개선 규칙)"
+  )
 }
 
 function resolveEventSessionId(event: any): string | null {
