@@ -511,15 +511,38 @@ function validateSkillFrontmatter(filePath: string): { ok: boolean; error?: stri
   }
 }
 
-function rollbackSkill(filePath: string, backupPath: string | null): void {
+function rollbackSkill(filePath: string, backupPath: string | null): "restored" | "restored-stale" | "left-in-place" {
   try {
     if (backupPath && fs.existsSync(backupPath)) {
       fs.copyFileSync(backupPath, filePath)
-    } else {
-      // No backup existed (this was a create); delete the broken file
-      try { fs.unlinkSync(filePath) } catch { /* noop */ }
+      return "restored"
     }
-  } catch { /* best-effort */ }
+    // The .before hook may not have fired (e.g. args shape mismatch), so
+    // backupsThisCall has nothing. Fall back to the newest retained backup
+    // for this skill before giving up.
+    const name = skillNameFromPath(filePath)
+    if (name) {
+      try {
+        const prefix = `${name}.`
+        const all = fs.readdirSync(BACKUP_DIR)
+          .filter((f: string) => f.startsWith(prefix) && f.endsWith(".SKILL.md"))
+          .sort()
+        const newest = all[all.length - 1]
+        if (newest) {
+          fs.copyFileSync(path.join(BACKUP_DIR, newest), filePath)
+          return "restored-stale"
+        }
+      } catch { /* fall through */ }
+    }
+    // NEVER unlink. The pre-fix code deleted the file here on the assumption
+    // that "no backup == this was a create", but a silent .before failure
+    // turns every edit into that path and destroyed a whole SKILL.md
+    // (2026-08-17 incident). An invalid file keeps its content recoverable;
+    // a deleted file does not.
+    return "left-in-place"
+  } catch {
+    return "left-in-place"
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -766,10 +789,22 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
     // ── Backup before SKILL.md edits ──────────────────────────────────────
     "tool.execute.before": async (input, output) => {
       try {
+        try {
+          const debugLogPath = path.join(STATE_DIR, "logs", "plugin-debug.log")
+          fs.appendFileSync(debugLogPath, JSON.stringify({
+            ts: new Date().toISOString(),
+            hook: "tool.execute.before",
+            tool: input.tool,
+            output_args_keys: output?.args ? Object.keys(output.args) : null,
+          }) + "\n")
+        } catch {}
+
         if (!EDIT_TOOLS.has(input.tool)) return
-        // input.args is not in the strict type but is present at runtime —
-        // cast to any so we can read filePath without fighting the type def.
-        const fp = (input as any).args?.filePath as string | undefined
+        // In the before-hook the SDK passes args via OUTPUT (mutable), not
+        // input — reading input.args silently yields undefined and skips the
+        // backup entirely (2026-08-17 data-loss root cause).
+        const args = output?.args ?? (input as any).args
+        const fp = args?.filePath as string | undefined
         if (!fp || !isSkillPath(fp)) return
         backupsThisCall[input.callID] = backupSkill(fp)
         const name = skillNameFromPath(fp)
@@ -835,20 +870,21 @@ export const SelfImprovingSkills: Plugin = async ({ client }) => {
             const v = validateSkillFrontmatter(fp)
             const name = skillNameFromPath(fp)
             if (!v.ok) {
-              rollbackSkill(fp, backupsThisCall[input.callID] ?? null)
+              const outcome = rollbackSkill(fp, backupsThisCall[input.callID] ?? null)
               try {
                 await client.app.log({
                   body: {
                     service: "self-improving-skills",
                     level: "error",
-                    message: `Rolled back ${name ?? "skill"}: ${v.error}`,
+                    message: `Rollback (${outcome}) for ${name ?? "skill"}: ${v.error}`,
                   },
                 })
               } catch { /* logging best-effort */ }
               // Throw to surface the failure to the agent
               throw new Error(
-                `[self-improving-skills] SKILL.md validation failed and was rolled back: ${v.error}. ` +
-                `Fix the frontmatter and try again. Backup retained at ${BACKUP_DIR}/.`
+                `[self-improving-skills] SKILL.md validation failed (${v.error}). ` +
+                `Rollback outcome: ${outcome}. ` +
+                `Fix the content (keep it under 30KB — move detail to references/) and try again.`
               )
             }
             // Valid — bump patch_count, forget-missing cleanup, prune marker
